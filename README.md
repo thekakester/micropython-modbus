@@ -10,6 +10,11 @@
 
 MicroPython ModBus TCP and RTU library supporting client and host mode
 
+This fork adds support for multiple active Modbus TCP client connections at the
+same time. The upstream project accepted multiple pending TCP connections in the
+socket backlog, but kept only one active client socket and closed the previous
+socket when a new client connected.
+
 ---------------
 
 ## General
