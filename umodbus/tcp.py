@@ -45,7 +45,7 @@ class ModbusTCP(Modbus):
         :type       local_ip:         str
         :param      local_port:       Port of this device
         :type       local_port:       int
-        :param      max_connections:  Number of maximum connections
+        :param      max_connections:  Number of maximum active connections
         :type       max_connections:  int
         """
         self._itf.bind(local_ip, local_port, max_connections)
@@ -194,6 +194,8 @@ class TCPServer(object):
     def __init__(self):
         self._sock = None
         self._client_sock = None
+        self._client_socks = []
+        self._max_connections = 10
         self._is_bound = False
 
     @property
@@ -226,11 +228,14 @@ class TCPServer(object):
         :type       local_ip:         str
         :param      local_port:       Port of this device
         :type       local_port:       int
-        :param      max_connections:  Number of maximum connections
+        :param      max_connections:  Number of maximum active connections
         :type       max_connections:  int
         """
-        if self._client_sock:
-            self._client_sock.close()
+        if self._client_socks:
+            for client_sock in self._client_socks:
+                client_sock.close()
+            self._client_socks = []
+            self._client_sock = None
 
         if self._sock:
             self._sock.close()
@@ -241,9 +246,24 @@ class TCPServer(object):
         # [(2, 1, 0, '192.168.178.47', ('192.168.178.47', 502))]
         self._sock.bind(socket.getaddrinfo(local_ip, local_port)[0][-1])
 
+        self._max_connections = max_connections
         self._sock.listen(max_connections)
 
         self._is_bound = True
+
+    def _close_client_sock(self, client_sock) -> None:
+        """
+        Close and remove the client socket.
+
+        :param      client_sock:  The client socket
+        """
+        client_sock.close()
+
+        if client_sock in self._client_socks:
+            self._client_socks.remove(client_sock)
+
+        if client_sock == self._client_sock:
+            self._client_sock = None
 
     def _send(self, modbus_pdu: bytes, slave_addr: int) -> None:
         """
@@ -332,22 +352,23 @@ class TCPServer(object):
                 raise e
 
         if new_client_sock is not None:
-            if self._client_sock is not None:
-                self._client_sock.close()
+            # recv() timeout is set to 0 to check all clients without blocking
+            new_client_sock.settimeout(0)
 
-            self._client_sock = new_client_sock
+            if len(self._client_socks) < self._max_connections:
+                self._client_socks.append(new_client_sock)
+            else:
+                new_client_sock.close()
 
-            # recv() timeout, setting to 0 might lead to the following error
-            # "Modbus request error: [Errno 11] EAGAIN"
-            # This is a socket timeout error
-            self._client_sock.settimeout(0.5)
+        for client_sock in list(self._client_socks):
+            self._client_sock = client_sock
 
-        if self._client_sock is not None:
             try:
-                req = self._client_sock.recv(128)
+                req = client_sock.recv(128)
 
                 if len(req) == 0:
-                    return None
+                    self._close_client_sock(client_sock)
+                    continue
 
                 req_header_no_uid = req[:Const.MBAP_HDR_LENGTH - 1]
                 self._req_tid, req_pid, req_len = struct.unpack('>HHH', req_header_no_uid)
@@ -355,29 +376,29 @@ class TCPServer(object):
             except OSError:
                 # MicroPython raises an OSError instead of socket.timeout
                 # print("Socket OSError aka TimeoutError: {}".format(e))
-                return None
+                continue
             except Exception:
                 # print("Modbus request error:", e)
-                self._client_sock.close()
-                self._client_sock = None
-                return None
+                self._close_client_sock(client_sock)
+                continue
 
             if (req_pid != 0):
                 # print("Modbus request error: PID not 0")
-                self._client_sock.close()
-                self._client_sock = None
-                return None
+                self._close_client_sock(client_sock)
+                continue
 
             if ((unit_addr_list is not None) and (req_uid_and_pdu[0] not in unit_addr_list)):
-                return None
+                continue
 
             try:
+                self._client_socks.remove(client_sock)
+                self._client_socks.append(client_sock)
                 return Request(self, req_uid_and_pdu)
             except ModbusException as e:
                 self.send_exception_response(req[0],
                                              e.function_code,
                                              e.exception_code)
-                return None
+                continue
 
     def get_request(self,
                     unit_addr_list: Optional[list] = None,
@@ -402,7 +423,7 @@ class TCPServer(object):
             start_ms = time.ticks_ms()
             elapsed = 0
             while True:
-                if self._client_sock is None:
+                if len(self._client_socks) == 0:
                     accept_timeout = None if timeout is None else (timeout - elapsed) / 1000
                 else:
                     accept_timeout = 0

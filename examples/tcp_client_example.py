@@ -70,6 +70,7 @@ is_bound = False
 is_bound = client.get_bound_status()
 
 if not is_bound:
+    # optional max_connections limits active TCP client connections
     client.bind(local_ip=local_ip, local_port=tcp_port)
 
 

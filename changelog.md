@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 -->
 
-<!-- ## [Unreleased] -->
+## [Unreleased]
+### Changed
+- Support multiple active TCP client connections up to the configured `max_connections` value
+  in [`tcp TCPServer bind function`](umodbus/tcp.py)
 
 ## Released
 ## [2.3.7] - 2023-07-19

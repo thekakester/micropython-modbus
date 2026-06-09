@@ -4,6 +4,7 @@
 from .test_absolute_truth import *
 from .test_const import *
 from .test_functions import *
+from .test_tcp_server import *
 
 # TestTcpExample is a non static test and requires a running TCP client
 # from .test_tcp_example import *
