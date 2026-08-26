@@ -25,6 +25,11 @@ from .modbus import Modbus
 from .typing import Optional, Tuple, Union
 
 
+# A non-blocking socket raises EAGAIN when no data is currently available.
+EAGAIN = 11
+SEND_TIMEOUT_MS = 500
+
+
 class ModbusTCP(Modbus):
     """Modbus TCP client class"""
     def __init__(self):
@@ -61,6 +66,10 @@ class ModbusTCP(Modbus):
             return self._itf.get_is_bound()
         except Exception:
             return False
+
+    def close(self) -> None:
+        """Close the listening socket and all connected client sockets."""
+        self._itf.close()
 
 
 class TCP(CommonModbusFunctions):
@@ -231,14 +240,7 @@ class TCPServer(object):
         :param      max_connections:  Number of maximum active connections
         :type       max_connections:  int
         """
-        if self._client_socks:
-            for client_sock in self._client_socks:
-                client_sock.close()
-            self._client_socks = []
-            self._client_sock = None
-
-        if self._sock:
-            self._sock.close()
+        self.close()
 
         self._sock = socket.socket()
 
@@ -251,13 +253,36 @@ class TCPServer(object):
 
         self._is_bound = True
 
+    def close(self) -> None:
+        """Close the server and every accepted client connection."""
+        for client_sock in list(self._client_socks):
+            self._close_client_sock(client_sock)
+
+        self._client_socks = []
+        self._client_sock = None
+
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                # The network interface may already have invalidated it.
+                pass
+            self._sock = None
+
+        self._is_bound = False
+
     def _close_client_sock(self, client_sock) -> None:
         """
         Close and remove the client socket.
 
         :param      client_sock:  The client socket
         """
-        client_sock.close()
+        try:
+            client_sock.close()
+        except OSError:
+            # The socket may already be invalid because of the disconnect
+            # that caused this cleanup. It must still be removed below.
+            pass
 
         if client_sock in self._client_socks:
             self._client_socks.remove(client_sock)
@@ -277,7 +302,28 @@ class TCPServer(object):
         size = len(modbus_pdu)
         fmt = 'B' * size
         adu = struct.pack('>HHHB' + fmt, self._req_tid, 0, size + 1, slave_addr, *modbus_pdu)
-        self._client_sock.send(adu)
+        self._send_all(self._client_sock, adu)
+
+    def _send_all(self, client_sock, data: bytes) -> None:
+        """Send an entire response through a non-blocking client socket."""
+        offset = 0
+        start_ms = time.ticks_ms()
+
+        while offset < len(data):
+            try:
+                sent = client_sock.send(data[offset:])
+            except OSError as exc:
+                if exc.args and exc.args[0] == EAGAIN:
+                    if time.ticks_diff(time.ticks_ms(), start_ms) >= SEND_TIMEOUT_MS:
+                        raise OSError("Modbus response send timed out")
+                    time.sleep_ms(1)
+                    continue
+                raise
+
+            if sent is None or sent <= 0:
+                raise OSError("Modbus response socket closed during send")
+
+            offset += sent
 
     def send_response(self,
                       slave_addr: int,
@@ -348,7 +394,7 @@ class TCPServer(object):
         try:
             new_client_sock, client_address = self._sock.accept()
         except OSError as e:
-            if e.args[0] != 11:     # 11 = timeout expired
+            if not e.args or e.args[0] != EAGAIN:
                 raise e
 
         if new_client_sock is not None:
@@ -373,9 +419,13 @@ class TCPServer(object):
                 req_header_no_uid = req[:Const.MBAP_HDR_LENGTH - 1]
                 self._req_tid, req_pid, req_len = struct.unpack('>HHH', req_header_no_uid)
                 req_uid_and_pdu = req[Const.MBAP_HDR_LENGTH - 1:Const.MBAP_HDR_LENGTH + req_len - 1]
-            except OSError:
-                # MicroPython raises an OSError instead of socket.timeout
-                # print("Socket OSError aka TimeoutError: {}".format(e))
+            except OSError as e:
+                # EAGAIN only means that this non-blocking socket has no data
+                # available right now. Other errors indicate a broken client
+                # connection, which must not remain in the active socket list.
+                if e.args and e.args[0] == EAGAIN:
+                    continue
+                self._close_client_sock(client_sock)
                 continue
             except Exception:
                 # print("Modbus request error:", e)
